@@ -35,3 +35,15 @@ def log(message, level: LogLevel):
             click.echo(click.style("✖ ", fg="red") + message, err=True)
         case "debug":
             click.echo(click.style("• ", fg="magenta") + message, err=True)
+
+def log_error(message):
+    log(message, "error")
+
+def log_warning(message):
+    log(message, "warning")
+
+def log_info(message):
+    log(message, "info")
+
+def log_debug(message):
+    log(message, "debug")

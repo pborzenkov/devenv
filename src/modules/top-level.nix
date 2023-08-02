@@ -135,7 +135,7 @@ in
       default = [ ];
       example = [ "you should fix this or that" ];
       description = ''
-        This option allows modules to express warnings about theV
+        This option allows modules to express warnings about the
         configuration. For example, `lib.mkRenamedOptionModule` uses this to
         display a warning message when a renamed option is used.
       '';
@@ -175,6 +175,7 @@ in
     ./debug.nix
     ./lib.nix
     ./tests.nix
+    ./cachix.nix
   ]
   ++ (listEntries ./languages)
   ++ (listEntries ./services)
@@ -233,8 +234,10 @@ in
       pkgs.mkShell ({
         name = "devenv-shell";
         packages = [ profile ];
-        shellHook = config.enterShell;
-        debug = config.devenv.debug;
+        shellHook = ''
+          ${lib.optionalString config.devenv.debug "set -x"}
+          ${config.enterShell}
+        '';
       } // config.env)
     );
 

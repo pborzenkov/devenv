@@ -88,9 +88,7 @@
         inherit (config) info procfileScript procfileEnv procfile;
         ci = config.ciDerivation;
       };
-      devenv = {
-        inherit (config) containers tests;
-      };
+      devenv = config;
       devShell."${system}" = config.shell;
     };
 }

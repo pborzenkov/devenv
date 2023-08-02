@@ -7,6 +7,7 @@
     pkgs.cairo
     pkgs.xorg.libxcb
     pkgs.yaml2json
+    pkgs.tesh
   ];
 
   languages.nix.enable = true;
@@ -42,6 +43,7 @@
     tmp="$(mktemp -d)"
     devenv init "$tmp"
     pushd "$tmp"
+      devenv version
       devenv ci
     popd
     rm -rf "$tmp"
@@ -124,5 +126,6 @@
     MD034 = false;
   };
 
-  tests = config.lib.mkTests [ "devenv" ] ./examples;
+  tests = config.lib.mkTests ./examples
+    // config.lib.mkTests ./tests;
 }

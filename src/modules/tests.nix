@@ -35,6 +35,7 @@ let
 
       src = lib.mkOption {
         type = lib.types.nullOr lib.types.path;
+        default = null;
         description = "Source code with all the files.";
       };
     };

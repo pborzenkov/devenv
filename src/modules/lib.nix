@@ -32,10 +32,10 @@
       in
         inputs.${name} or (throw "To use '${attribute}', ${command}\n\n");
 
-    mkTests = tags: folder:
+    mkTests = folder:
       let
         mk = dir: {
-          inherit tags;
+          tags = [ "local" ];
           src = "${folder}/${dir}";
         };
       in

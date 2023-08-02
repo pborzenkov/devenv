@@ -181,6 +181,8 @@ in
       (lib.mkIf (cfg.version != null) (nixpkgs-python.packages.${pkgs.stdenv.system}.${cfg.version} or (throw "Unsupported Python version, see https://github.com/cachix/nixpkgs-python#supported-python-versions")))
     ];
 
+    cachix.pull = lib.mkIf (cfg.version != null) [ "nixpkgs-python" ];
+
     packages = [
       cfg.package
     ] ++ (lib.optional cfg.poetry.enable cfg.poetry.package);

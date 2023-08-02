@@ -1,3 +1,4 @@
+import functools
 import os
 import shlex
 import shutil
@@ -7,20 +8,19 @@ import tempfile
 import time
 import re
 import sys
+import pkgutil
+import json
 from filelock import FileLock
 from contextlib import suppress
 from pathlib import Path
 
-import pkgutil
-import json
-
 import click
 import terminaltables
 import strictyaml
-
+import requests
 
 from .yaml import validate_and_parse_yaml, read_yaml, write_yaml, schema
-from .log import log, log_task
+from .log import log, log_task, log_error, log_warning, log_info, log_debug
 
 
 NIX_FLAGS = [
@@ -43,19 +43,29 @@ FLAKE_FILE_TEMPL = Path(MODULES_DIR) / "flake.tmpl.nix"
 FLAKE_FILE = Path(".devenv.flake.nix")
 FLAKE_LOCK = "devenv.lock"
 
+# home vars
+if 'XDG_DATA_HOME' not in os.environ:
+    DEVENV_HOME = Path(os.environ['HOME']) / '.devenv'
+else:
+    DEVENV_HOME = Path(os.environ['XDG_DATA_HOME']) / '.devenv'
+DEVENV_HOME_GC = DEVENV_HOME / 'gc'
+DEVENV_HOME_GC.mkdir(parents=True, exist_ok=True)
+CACHIX_KNOWN_PUBKEYS = DEVENV_HOME / "cachix_pubkeys.json"
+
 # define system like x86_64-linux
 SYSTEM = os.uname().machine.lower().replace("arm", "aarch") + "-" + os.uname().sysname.lower()
 
-def run_nix(command: str, skip_exc_wrapping=False, replace_shell=False) -> str:
+def run_nix(command: str, replace_shell=False, use_cachix=False) -> str:
     ctx = click.get_current_context()
     nix_flags = ctx.obj['nix_flags']
     flags = " ".join(NIX_FLAGS) + " " + " ".join(nix_flags)
     command_flags = " ".join(ctx.obj['command_flags'])
     return run_command(f"nix {flags} {command} {command_flags}",
-                       skip_exc_wrapping=skip_exc_wrapping,
-                       replace_shell=replace_shell)
+                       replace_shell=replace_shell,
+                       use_cachix=use_cachix)
 
-def run_command(command: str, disable_stderr=False, skip_exc_wrapping=False, replace_shell=False) -> str:
+def run_command(command: str, disable_stderr=False, replace_shell=False, use_cachix=False) -> str:
+    nix = ""
     if command.startswith("nix"):
         if os.environ.get("DEVENV_NIX"):
             nix = os.path.join(os.environ["DEVENV_NIX"], "bin")
@@ -64,6 +74,18 @@ def run_command(command: str, disable_stderr=False, skip_exc_wrapping=False, rep
             log("$DEVENV_NIX is not set, but required as devenv doesn't work without a few Nix patches.", level="error")
             log("Please follow https://devenv.sh/getting-started/ to install devenv.", level="error")
             exit(1)
+    if use_cachix:
+        caches, known_keys = get_cachix_caches()
+        pull_caches = ' '.join(map(lambda cache: f'https://{cache}.cachix.org', caches.get('pull')))
+        command = f"{command} --option extra-trusted-public-keys '{' '.join(known_keys.values())}'"
+        command = f"{command} --option extra-substituters '{pull_caches}'"
+        push_cache = caches.get("push")
+        if push_cache:
+            if shutil.which("cachix") is None:
+                log_warning("cachix is not installed, not pushing. Please follow https://devenv.sh/getting-started/#2-install-cachix to install cachix.", level="error")  
+            else:
+                command = f"cachix watch-exec {push_cache} {command}"
+            
     try:
         if click.get_current_context().obj['verbose']:
             log(f"Running command: {command}", level="debug")
@@ -81,12 +103,9 @@ def run_command(command: str, disable_stderr=False, skip_exc_wrapping=False, rep
                 stderr=None if not disable_stderr else subprocess.DEVNULL,
                 universal_newlines=True).stdout.strip()
     except subprocess.CalledProcessError as e:
-        if skip_exc_wrapping:
-            exit(e.returncode)
-        else:
-            click.echo("\n", err=True)
-            log(f"Following command exited with code {e.returncode}:\n\n  {e.cmd}", level="error")
-            exit(e.returncode)
+        click.echo("\n", err=True)
+        log(f"Following command exited with code {e.returncode}:\n\n  {e.cmd}", level="error")
+        exit(e.returncode)
 
 CONTEXT_SETTINGS = dict(max_content_width=120)
 
@@ -135,13 +154,8 @@ def cli(ctx, disable_eval_cache, offline, system, debugger, nix_flags, verbose):
     if disable_eval_cache:
         ctx.obj['nix_flags'] += ['--option', 'eval-cache', 'false']
 
-    if 'XDG_DATA_HOME' not in os.environ:
-        ctx.obj['gc_root'] = os.path.join(os.environ['HOME'], '.devenv', 'gc')
-    else:
-        ctx.obj['gc_root'] = os.path.join(os.environ['XDG_DATA_HOME'], 'devenv', 'gc')
-    
-    Path(ctx.obj['gc_root']).mkdir(parents=True, exist_ok=True)
-    ctx.obj['gc_project'] = os.path.join(ctx.obj['gc_root'], str(int(time.time() * 1000)))
+    ctx.obj['gc_root'] = DEVENV_HOME_GC
+    ctx.obj['gc_project'] = DEVENV_HOME_GC / str(int(time.time() * 1000))
 
 @cli.group()
 def processes():
@@ -161,7 +175,7 @@ def add_gc(name, store_path):
     """Register a GC root"""
     ctx = click.get_current_context()
     run_command(f'nix-store --add-root "{os.environ["DEVENV_GC"]}/{name}" -r {store_path} >/dev/null')
-    os.symlink(store_path, f'{ctx.obj["gc_project"]}-{name}', True)
+    symlink_force(store_path, f'{ctx.obj["gc_project"]}-{name}')
 
 
 @cli.command(hidden=True)
@@ -213,7 +227,7 @@ def gc(ctx):
     click.echo(f'  Deleted {len(removed_symlinks)} dangling symlinks.')
     click.echo()
 
-    log(f'Running garbage collection (this process may take some time) ...', level="info")
+    log('Running garbage collection (this process may take some time) ...', level="info")
     # TODO: ideally nix would report some statistics about the GC as JSON
     run_nix(f'store delete --recursive {" ".join(to_gc)}')
 
@@ -245,7 +259,7 @@ def get_dev_environment(ctx, logging=True):
         action = suppress()
     with action:
         gc_root = os.path.join(os.environ['DEVENV_GC'], 'shell')
-        env = run_nix(f"print-dev-env --profile '{gc_root}'")
+        env = run_nix(f"print-dev-env --profile '{gc_root}'", use_cachix=True)
         run_command(f"nix-env -p '{gc_root}' --delete-generations old", disable_stderr=True)
         symlink_force(Path(f'{ctx.obj["gc_project"]}-shell'), gc_root)
     return env, gc_root
@@ -271,22 +285,24 @@ def shell(ctx, cmd, extra_args):
         run_nix(f"develop '{gc_root}'", replace_shell=True)
         
 def symlink_force(src, dst):
+    src = Path(src)
+    dst = Path(dst)
     # locking is needed until https://github.com/python/cpython/pull/14464
     with FileLock(f"{dst}.lock", timeout=10):
-        src.unlink(missing_ok=True)
-        Path(src).symlink_to(dst)
+        dst.unlink(missing_ok=True)
+        dst.symlink_to(src)
 
 @cli.command(
     help="Starts processes in foreground. See http://devenv.sh/processes", 
     short_help="Starts processes in foreground. See http://devenv.sh/processes",
 )
-@click.argument('command', required=False)
+@click.argument('process', required=False)
 @click.option('--detach', '-d', is_flag=True, help="Starts processes in the background.")
 @click.pass_context
-def up(ctx, command, detach):
+def up(ctx, process, detach):
     with log_task('Building processes'):
         ctx.invoke(assemble)
-        procfilescript = run_nix(f"build --no-link --print-out-paths '.#procfileScript'")
+        procfilescript = run_nix("build --no-link --print-out-paths '.#procfileScript'", use_cachix=True)
     with open(procfilescript, 'r') as file:
         contents = file.read().strip()
     if contents == '':
@@ -300,7 +316,7 @@ def up(ctx, command, detach):
         with open(processes_script, 'w') as f:
             f.write(f"""#!/usr/bin/env bash
 {env}
-{procfilescript} {command or ""}
+{procfilescript} {process or ""}
             """)
         os.chmod(processes_script, 0o755)
         
@@ -315,7 +331,7 @@ def up(ctx, command, detach):
                 file.write(str(process.pid))
             log(f"  PID is {process.pid}.", level="info")
             log(f"  See logs:  $ tail -f {PROCESSES_LOG}", level="info")
-            log(f"  Stop:      $ devenv processes stop", level="info")
+            log("  Stop:      $ devenv processes stop", level="info")
         else:
             os.execv(processes_script, [processes_script])
 
@@ -348,7 +364,7 @@ def stop():
 def search(ctx, name):
     """Search packages matching NAME in nixpkgs input."""
     ctx.invoke(assemble)
-    options = run_nix(f"build --no-link --print-out-paths '.#optionsJSON' ")
+    options = run_nix("build --no-link --print-out-paths '.#optionsJSON' ", use_cachix=True)
     search = run_nix(f"search --json nixpkgs {name}")
 
     with open(Path(options) / 'share' / 'doc' / 'nixos' / 'options.json') as f:
@@ -407,7 +423,7 @@ def container(ctx, registry, copy, copy_args, docker_run, container_name):
     with log_task(f'Building {container_name} container'):
         ctx.invoke(assemble)
         # NOTE: we need --impure here to read DEVENV_CONTAINER
-        spec = run_nix(f"build --impure --print-out-paths --no-link .#devenv.containers.\"{container_name}\".derivation")
+        spec = run_nix(f"build --impure --print-out-paths --no-link .#devenv.containers.\"{container_name}\".derivation", use_cachix=True)
         click.echo(spec)
   
     # copy container
@@ -415,7 +431,7 @@ def container(ctx, registry, copy, copy_args, docker_run, container_name):
         with log_task(f'Copying {container_name} container'):
             # we need --impure here for DEVENV_CONTAINER
             copy_script = run_nix(f"build --print-out-paths --no-link \
-            --impure .#devenv.containers.\"{container_name}\".copyScript")
+            --impure .#devenv.containers.\"{container_name}\".copyScript", use_cachix=True)
             
             if docker_run:
                 registry = "docker-daemon:"
@@ -429,7 +445,7 @@ def container(ctx, registry, copy, copy_args, docker_run, container_name):
         log(f'Starting {container_name} container', level="info")
         # we need --impure here for DEVENV_CONTAINER
         docker_script = run_nix(f"build --print-out-paths --no-link --impure \
-              .#devenv.containers.\"{container_name}\".dockerRun")
+              .#devenv.containers.\"{container_name}\".dockerRun", use_cachix=True)
             
         subprocess.run(docker_script)
 
@@ -515,14 +531,16 @@ def update(ctx, input_name):
     if input_name:
         run_nix(f"flake lock --update-input {input_name}")
     else:
-        run_nix(f"flake update")
+        run_nix("flake update")
 
 @cli.command()
 @click.pass_context
 def ci(ctx):
     """Builds your developer environment and checks if everything builds."""
     ctx.invoke(assemble)
-    output_path = run_nix(f"build --no-link --print-out-paths --impure .#ci")
+    print("running ci")
+    print(run_command("cat ${FLAKE_FILE}"))
+    output_path = run_nix("build --no-link --print-out-paths .#ci", use_cachix=True)
     add_gc('ci', output_path)
 
 @cli.command(hidden=True)
@@ -576,11 +594,11 @@ def add(ctx, name, url, follows):
 @click.pass_context
 def test(ctx, debug, names):
     ctx.invoke(assemble)
-    with log_task(f"Gathering tests", newline=False):
-        tests = json.loads(run_nix(f"eval .#devenv.tests --json"))
+    with log_task("Gathering tests", newline=False):
+        tests = json.loads(run_nix("eval .#devenv.tests --json"))
 
     if not names:
-        names = "local"
+        names = [ "local" ]
 
     # group tests by tags
     tags = {}
@@ -598,12 +616,12 @@ def test(ctx, debug, names):
         if tag_tests:
             selected_tests.extend(tag_tests)
 
-    log(f"Found {len(selected_tests)} tests:", level="info")
+    log(f"Found {len(tests)} test(s), running {len(selected_tests)}:", level="info")
 
     pwd = os.getcwd()
 
     for name in selected_tests:
-        with log_task(f"  Running {name}"):
+        with log_task(f"  Testing {name}"):
             with tempfile.TemporaryDirectory(prefix=name + "_") as tmpdir:
                 os.chdir(tmpdir)
                 test = tests[name]
@@ -646,16 +664,16 @@ def test(ctx, debug, names):
                 devenv = sys.argv[0]
                 has_processes = False
                 try:
-                    log("    Running $ devenv ci", level="info")
+                    log("    Running $ devenv ci ...", level="info")
                     run_command(f"{devenv} ci")
 
                     has_processes = os.path.exists(".devenv/gc/ci") and "-devenv-up" in run_command("cat .devenv/gc/ci")
 
                     if has_processes:
-                        log("    Detected processes. Starting them.", level="info")
+                        log("    Starting processes ...", level="info")
                         run_command(f"{devenv} up -d")
                         # stream logs
-                        p = subprocess.Popen(f"tail -f .devenv/processes.log", 
+                        p = subprocess.Popen("tail -f .devenv/processes.log", 
                             shell=True,
                         )
                     else:
@@ -663,7 +681,7 @@ def test(ctx, debug, names):
 
                     try:
                         if os.path.exists(".test.sh"):
-                            log("    Detected .test.sh. Running it.", level="info")
+                            log("    Running .test.sh ...", level="info")
                             run_command(f"{devenv} shell bash ./.test.sh")
                     finally:
                         if has_processes and not debug:
@@ -671,18 +689,67 @@ def test(ctx, debug, names):
                             if p:
                                 p.kill()
                 except BaseException as e:
-                    log(f"Test {name} failed.", level="error")
+                    log_error(f"Test {name} failed.")
                     if debug:
-                        log(f"Entering shell because of the --debug flag:", level="warning")
+                        log("Entering shell because of the --debug flag:", level="warning")
                         log(f"  - devenv: {devenv}", level="warning")
                         log(f"  - cwd: {tmpdir}", level="warning")
                         if has_processes:
-                            log(f"  - up logs: .devenv/processes.log:", level="warning")
+                            log("  - up logs: .devenv/processes.log:", level="warning")
                         os.execv("/bin/sh", ["/bin/sh"])
                     else:
+                        log_warning('Pass --debug flag to enter shell.')
                         raise e
 
 def write_if_defined(file, content):
     if content:
         with open(file, 'w') as f:
             f.write(content)
+
+@functools.cache
+def get_cachix_caches():
+    """Get the full list of cachix caches we need and their public keys.
+    
+    This is cached because it's expensive to run.
+    """
+    
+    caches = json.loads(run_nix("eval .#devenv.cachix --json"))
+    if CACHIX_KNOWN_PUBKEYS.exists():
+        known_keys = json.loads(CACHIX_KNOWN_PUBKEYS.read_text())
+    else:
+        known_keys = {}
+    new_known_keys = {}
+    for name in caches.get("pull", []):
+        if name not in known_keys:
+            resp = requests.get(f"https://cachix.org/api/v1/cache/{name}")
+            if resp.status_code in [401, 404]:
+                log_error(f"Cache {name} does not exist or you don't have a CACHIX_AUTH_TOKEN configured.")
+                # TODO: instruct how to best configure netrc
+                #log_error("To configure a token, run `cachix authtoken <token>`.")
+                log_error("To create a cache, go to https://app.cachix.org/.")
+                exit(1)
+            else:
+                resp.raise_for_status()
+                pubkey = resp.json()["publicSigningKeys"][0]
+                new_known_keys[name] = pubkey
+                
+    if caches.get("pull"):
+        log_info(f"Using Cachix: {', '.join(caches.get('pull', []))} ")
+        if new_known_keys:
+            for name, pubkey in new_known_keys.items():
+                log_info(f"  Trusting {name}.cachix.org on first use with the public key {pubkey}")
+            known_keys.update(new_known_keys)
+        CACHIX_KNOWN_PUBKEYS.write_text(json.dumps(known_keys))
+    return caches, known_keys
+
+@cli.command()
+@click.argument('attrs', nargs=-1, required=True)
+@click.pass_context
+def build(ctx, attrs):
+    """Build attributes in your devenv.nix."""
+    ctx.invoke(assemble)
+    attrs = " ".join(map(lambda attr: f'.#devenv.{attr}', attrs))
+    output = run_nix(f"build --print-out-paths --print-build-logs --no-link {attrs}", use_cachix=True)
+    log("Built:", level="info")
+    for path in output.splitlines():
+        log(path, level="info")
